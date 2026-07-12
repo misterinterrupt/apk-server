@@ -53,7 +53,6 @@ def get_local_ips():
     """Return list of IPs this machine is reachable on (tailnet + LAN)."""
     ips = []
     try:
-        # Connect to a public address to determine which interface is used
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ips.append(s.getsockname()[0])
@@ -61,7 +60,6 @@ def get_local_ips():
     except Exception:
         pass
 
-    # Also grab all interface IPs
     try:
         result = subprocess.run(
             ["ip", "-4", "-o", "addr"], capture_output=True, text=True, timeout=2
@@ -90,14 +88,46 @@ def git_commit():
         return "unknown"
 
 
+def git_build_number():
+    """Total commit count on HEAD — a monotonically increasing build number."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            capture_output=True, text=True, timeout=2
+        )
+        return result.stdout.strip() or "0"
+    except Exception:
+        return "0"
+
+
+def git_dirty():
+    """True if working tree has uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=2
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
 APK_PATH = find_apk()
+COMMIT = git_commit()
+BUILD = git_build_number()
+DIRTY = "-dirty" if git_dirty() else ""
+# Filename shown in the download bar — unique per commit so no (1)/(2) collisions.
+APK_FILENAME = f"{APP_NAME.lower()}-{BUILD}-{COMMIT}{DIRTY}.apk"
+# URL path for the download (matches filename so browsers that ignore
+# Content-Disposition still save the right name).
+APK_ROUTE = f"/{APK_FILENAME}"
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self.serve_landing()
-        elif self.path == "/app-debug.apk":
+        elif self.path == "/app-debug.apk" or self.path == APK_ROUTE:
             self.serve_apk()
         else:
             self.send_response(404)
@@ -114,7 +144,6 @@ class Handler(BaseHTTPRequestHandler):
             size_mb = 0
             modified = "?"
 
-        commit = git_commit()
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -139,10 +168,10 @@ class Handler(BaseHTTPRequestHandler):
 <body>
   <h1>\U0001f916 {APP_NAME} Debug APK</h1>
   <p class="subtitle">Tap to download, then open the file to install.</p>
-  <a class="download" href="/app-debug.apk">\u2b07\ufe0f Download {APP_NAME} ({size_mb:.1f} MB)</a>
+  <a class="download" href="{APK_ROUTE}">\u2b07\ufe0f Download {APP_NAME} ({size_mb:.1f} MB)</a>
   <div class="info">
-    <p><strong>Build:</strong> {modified}</p>
-    <p><strong>Commit:</strong> <code>{commit}</code></p>
+    <p><strong>Build:</strong> #{BUILD} <code>{COMMIT}</code>{DIRTY}</p>
+    <p><strong>Built:</strong> {modified}</p>
     <p><strong>Package:</strong> <code>{PACKAGE}</code></p>
     <p><strong>Size:</strong> {size_mb:.1f} MB</p>
     <hr style="border-color:#333;margin:20px 0">
@@ -170,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/vnd.android.package-archive")
         self.send_header("Content-Length", str(size))
         self.send_header(
-            "Content-Disposition", f'attachment; filename="{APP_NAME.lower()}-debug.apk"'
+            "Content-Disposition", f'attachment; filename="{APK_FILENAME}"'
         )
         self.end_headers()
         with open(APK_PATH, "rb") as f:
@@ -191,6 +220,8 @@ if __name__ == "__main__":
         print(f"  Built: {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}")
     except OSError:
         pass
+    print(f"  Build: #{BUILD} {COMMIT}{DIRTY}")
+    print(f"  File:  {APK_FILENAME}")
     print(f"\n\033[1mDownload from your phone:\033[0m")
     for ip in get_local_ips():
         print(f"  \033[36mhttp://{ip}:{PORT}\033[0m")
