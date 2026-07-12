@@ -1,45 +1,58 @@
 # RobotNerd APK Server
 
-A tiny HTTP server that serves the debug APK for download to your phone over the
-tailnet. Part of the phone-based dev workflow: build on the dev machine, download
-on the phone, install and test.
+A build archive + HTTP server for delivering debug APKs to your phone over the
+tailnet. Part of the phone-based dev workflow: build on the dev machine,
+download on the phone, install and test.
+
+## Workflow
+
+```bash
+# 1. Build and archive a new APK
+./apk-server/publish.sh
+
+# 2. Serve it (leave running in the background)
+./apk-server/serve.py
+```
+
+Each published build is archived in `apk-server/builds/` with a unique name:
+
+```
+robotnerd-{build}-{commit}[-dirty].apk
+```
+
+- **build** — commit count (monotonically increasing integer)
+- **commit** — short git hash
+- **dirty** — appended when there are uncommitted changes at publish time
+
+The landing page lists all builds, newest first. The server re-scans the
+archive on every request, so newly published builds appear instantly without a
+restart.
 
 ## Usage
 
-```bash
-# From anywhere — it auto-finds the APK by walking up to the Gradle root
-./apk-server/serve.py
-
-# Custom port
-PORT=9000 ./apk-server/serve.py
-
-# Explicit APK path (if auto-detect fails)
-./apk-server/serve.py /path/to/some.apk
-```
-
-On startup it prints all reachable URLs (tailnet + LAN IPs). Open one on your
-phone, tap download, install.
-
-## How it works
-
-- **Auto-discovery:** Walks up from `serve.py` looking for `settings.gradle.kts`
-  (the Gradle project root), then finds the APK at
-  `app/build/outputs/apk/debug/app-debug.apk`. No hardcoded paths.
-- **Binds to `0.0.0.0`:** Reachable from any interface (tailnet, LAN, localhost).
-- **Landing page:** Shows file size, build time, git commit, and package name.
-- **Direct download:** `http://<ip>:8080/app-debug.apk` for scripted/automated pulls.
-
-## Build the APK first
+### publish.sh
 
 ```bash
-export ANDROID_HOME=$(pwd)/android-sdk
-./gradlew :app:assembleDebug
+./apk-server/publish.sh             # build + archive
+./apk-server/publish.sh --force     # rebuild even if same commit already archived
 ```
 
-Then run the server. The APK lands at
-`app/build/outputs/apk/debug/app-debug.apk`.
+Skips the build if the same clean commit is already archived (use `--force` to
+override). Dirty builds always rebuild since the source may have changed.
+
+### serve.py
+
+```bash
+./apk-server/serve.py               # port 8080
+PORT=9000 ./apk-server/serve.py     # custom port
+```
+
+On startup it prints all reachable URLs (tailnet + LAN IPs). The server binds
+to `0.0.0.0` so it's reachable from any interface.
 
 ## Notes
 
-- You may need to allow **"Install unknown apps"** for your browser in Android Settings.
-- Python 3 only (no Node.js required). Uses only the standard library.
+- The `builds/` directory is gitignored (large binaries, machine-local).
+- Python 3 only (stdlib). No Node.js required.
+- You may need to allow **"Install unknown apps"** for your browser in Android
+  Settings.
