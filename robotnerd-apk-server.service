@@ -1,0 +1,20 @@
+[Unit]
+Description=RobotNerd APK Server (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/interrupt/Documents/robot_nerd/chatbot-app
+ExecStart=/usr/bin/python3 apk-server/serve.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robotnerd-apk-server
+
+[Install]
+WantedBy=default.target
