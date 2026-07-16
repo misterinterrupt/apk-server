@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/interrupt/Documents/robot_nerd/chatbot-app
 ExecStart=/usr/bin/python3 apk-server/serve.py
-Restart=on-failure
+# `always` (not `on-failure`): a stray SIGTERM/SIGKILL from a tool or
+# manual kill will also trigger a restart, so the server can't be left
+# dead by accident. Explicit `systemctl --user stop` is still respected.
+Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 

@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-RobotNerd APK Server — serves archived debug APKs over HTTP.
+APK Server — serves archived debug APKs over HTTP, with project tabs.
 
-Each published build lives in builds/ with a unique name:
-  robotnerd-{build}-{commit}[-dirty].apk
+Builds are organized into project subfolders under builds/:
+  builds/robotnerd/robotnerd-{build}-{commit}[-dirty].apk
+  builds/growbuild/growbuild-{build}-{commit}[-dirty].apk
 
-The landing page lists all builds, newest first. The server re-scans
-builds/ on every request, so newly published builds appear instantly
-without a restart.
-
-Publish new builds with:
-  ./apk-server/publish.sh
+The landing page shows a tab for each project. The server re-scans on every
+request, so newly published builds appear instantly without a restart.
 
 Usage:
     ./serve.py                # port 8080
@@ -27,19 +24,23 @@ from pathlib import Path
 from urllib.parse import unquote, quote
 
 PORT = int(os.environ.get("PORT", "8080"))
-PACKAGE = "com.ntrpt.robotnerd"
-APP_NAME = "RobotNerd"
-APP_SLUG = APP_NAME.lower()
 
 HERE = Path(__file__).resolve().parent
 BUILDS_DIR = HERE / "builds"
 
-# Filename pattern: robotnerd-5-8874d22-dirty.apk
-APK_PATTERN = re.compile(rf"^{APP_SLUG}-(\d+)-([0-9a-f]+)(-dirty)?\.apk$")
+# Filename pattern: <anything>-<build>-<commit>[-dirty].apk
+APK_PATTERN = re.compile(r"^(.+)-(\d+)-([0-9a-f]+)(-dirty)?\.apk$")
+
+# Known projects: (folder, display_name, accent_color)
+PROJECTS = [
+    ("robotnerd", "RobotNerd", "#7c4dff"),
+    ("growbuild", "Grow & Build", "#4caf50"),
+]
+
+PROJECT_MAP = {folder: (name, color) for folder, name, color in PROJECTS}
 
 
 def get_local_ips():
-    """Return list of IPs this machine is reachable on (tailnet + LAN)."""
     ips = []
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -64,23 +65,21 @@ def get_local_ips():
 
 
 class Build:
-    """Represents one archived APK, with metadata parsed from its filename."""
-
-    def __init__(self, path):
+    def __init__(self, path, project):
         self.path = path
+        self.project = project
         self.filename = path.name
-        self.url = "/" + quote(self.filename)
+        self.url = f"/{project}/{quote(self.filename)}"
         stat = path.stat()
         self.size_mb = stat.st_size / 1024 / 1024
         self.modified = datetime.fromtimestamp(stat.st_mtime)
 
         m = APK_PATTERN.match(self.filename)
         if m:
-            self.build_num = int(m.group(1))
-            self.commit = m.group(2)
-            self.dirty = bool(m.group(3))
+            self.build_num = int(m.group(2))
+            self.commit = m.group(3)
+            self.dirty = bool(m.group(4))
         else:
-            # Unrecognized filename — show it as-is
             self.build_num = 0
             self.commit = self.filename
             self.dirty = False
@@ -93,22 +92,39 @@ class Build:
         return (self.build_num, self.modified)
 
 
-def get_builds():
-    """Scan builds/ and return all APKs sorted newest first."""
+def get_projects():
+    result = []
+    for folder, name, color in PROJECTS:
+        if (BUILDS_DIR / folder).is_dir():
+            result.append((folder, name, color))
+    return result
+
+
+def get_builds(project=None):
     if not BUILDS_DIR.exists():
         return []
-    builds = [Build(f) for f in BUILDS_DIR.glob("*.apk")]
+    builds = []
+    if project:
+        pdir = BUILDS_DIR / project
+        if pdir.is_dir():
+            builds = [Build(f, project) for f in pdir.glob("*.apk")]
+    else:
+        for folder, _, _ in get_projects():
+            pdir = BUILDS_DIR / folder
+            if pdir.is_dir():
+                builds.extend(Build(f, folder) for f in pdir.glob("*.apk"))
     builds.sort(key=Build.sort_key, reverse=True)
     return builds
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = unquote(self.path)
-        if path in ("/", "/index.html"):
+        # Strip query string for routing.
+        path_only = unquote(self.path.split("?", 1)[0])
+        if path_only in ("/", "/index.html"):
             self.serve_landing()
-        elif path.endswith(".apk"):
-            self.serve_apk(path)
+        elif path_only.endswith(".apk"):
+            self.serve_apk(path_only)
         else:
             self.not_found()
 
@@ -119,9 +135,43 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"Not found")
 
     def serve_landing(self):
-        builds = get_builds()
+        projects = get_projects()
+
+        # Determine active project from ?project= query param.
+        active_project = None
+        if "?" in self.path:
+            query = self.path.split("?", 1)[1]
+            for pair in query.split("&"):
+                if pair.startswith("project="):
+                    candidate = unquote(pair[8:])
+                    if candidate in [p[0] for p in projects]:
+                        active_project = candidate
+                    break
+
+        if active_project:
+            builds = get_builds(active_project)
+        elif projects:
+            active_project = projects[0][0]
+            builds = get_builds(active_project)
+        else:
+            builds = []
+
         latest = builds[0] if builds else None
-        older = builds[1:] if builds else []
+        older = builds[1:] if len(builds) > 1 else []
+
+        # Tabs
+        tabs_html = ""
+        if len(projects) > 1:
+            tab_items = []
+            for folder, name, color in projects:
+                cls = "tab active" if folder == active_project else "tab"
+                border = color if folder == active_project else "transparent"
+                tab_items.append(
+                    f'<a class="{cls}" href="/?project={folder}" '
+                    f'style="border-color: {border}">'
+                    f'<span class="tab-dot" style="background:{color}"></span>{name}</a>'
+                )
+            tabs_html = f'<div class="tabs">{"".join(tab_items)}</div>'
 
         if latest:
             latest_html = (
@@ -135,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
             latest_html = (
                 '  <div class="empty">\n'
                 "    <p>No builds published yet.</p>\n"
-                '    <p class="muted">Run <code>./apk-server/publish.sh</code> '
+                '    <p class="muted">Run <code>./publish.sh</code> '
                 "to build and archive an APK.</p>\n"
                 "  </div>"
             )
@@ -143,9 +193,7 @@ class Handler(BaseHTTPRequestHandler):
         if older:
             rows = []
             for b in older:
-                dirty_tag = (
-                    ' <span class="dirty">dirty</span>' if b.dirty else ""
-                )
+                dirty_tag = ' <span class="dirty">dirty</span>' if b.dirty else ""
                 rows.append(
                     f'    <a class="row" href="{b.url}">\n'
                     f'      <span class="row-num">#{b.build_num}</span>\n'
@@ -166,13 +214,16 @@ class Handler(BaseHTTPRequestHandler):
 
         total = len(builds)
         word = "build" if total == 1 else "builds"
+        proj_info = PROJECT_MAP.get(active_project, ("App", "#7c4dff"))
+        active_name = proj_info[0]
+        active_color = proj_info[1]
 
         html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{APP_NAME} APKs</title>
+<title>{active_name} APKs</title>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 640px;
          margin: 0 auto; padding: 32px 20px; background: #1a1a2e; color: #e0e0e0; }}
@@ -180,18 +231,27 @@ class Handler(BaseHTTPRequestHandler):
   h2 {{ font-size: 1em; text-transform: uppercase; letter-spacing: 1px;
        color: #666; margin: 32px 0 12px; }}
   .count {{ color: #555; font-size: 0.85em; margin-bottom: 8px; }}
+  .tabs {{ display: flex; gap: 4px; margin-bottom: 24px; flex-wrap: wrap; }}
+  .tab {{ display: inline-flex; align-items: center; gap: 6px;
+         padding: 8px 16px; border-radius: 20px; text-decoration: none;
+         color: #999; font-size: 0.9em; font-weight: 500;
+         background: #1e1e36; border: 2px solid transparent; transition: all .15s; }}
+  .tab:hover {{ background: #26264a; }}
+  .tab.active {{ color: #e0e0e0; }}
+  .tab-dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
   a.latest {{ display: block; text-align: center; padding: 24px;
-       background: #2a2a4e; border-radius: 14px; border: 1px solid #7c4dff;
+       background: #2a2a4e; border-radius: 14px;
+       border: 1px solid {active_color};
        text-decoration: none; margin: 20px 0; transition: background .15s; }}
   a.latest:hover {{ background: #3a3a5e; }}
-  .latest-label {{ display: block; font-size: 1.3em; color: #7c4dff; font-weight: 600; }}
+  .latest-label {{ display: block; font-size: 1.3em; color: {active_color}; font-weight: 600; }}
   .latest-info {{ display: block; margin-top: 8px; color: #888; font-size: 0.9em; }}
   .build-list {{ display: flex; flex-direction: column; gap: 2px; }}
   a.row {{ display: flex; align-items: center; gap: 12px; padding: 12px 16px;
        background: #1e1e36; border-radius: 8px; text-decoration: none;
        color: #ccc; font-size: 0.9em; transition: background .15s; }}
   a.row:hover {{ background: #26264a; }}
-  .row-num {{ color: #7c4dff; font-weight: 600; min-width: 36px; }}
+  .row-num {{ color: {active_color}; font-weight: 600; min-width: 36px; }}
   .row-commit {{ font-family: monospace; font-size: 0.85em; flex: 1; }}
   .row-size {{ color: #888; min-width: 64px; text-align: right; }}
   .row-date {{ color: #666; font-size: 0.85em; min-width: 100px; text-align: right; }}
@@ -199,18 +259,18 @@ class Handler(BaseHTTPRequestHandler):
   .empty {{ text-align: center; padding: 48px 0; color: #888; }}
   .muted {{ color: #555; font-size: 0.9em; }}
   code {{ background: #0d0d1a; padding: 2px 8px; border-radius: 4px;
-         color: #7c4dff; font-size: 0.85em; }}
+         color: {active_color}; font-size: 0.85em; }}
   .footer {{ margin-top: 40px; padding-top: 20px; border-top: 1px solid #2a2a4e;
             color: #555; font-size: 0.8em; line-height: 1.7; }}
 </style>
 </head>
 <body>
-  <h1>\U0001f916 {APP_NAME}</h1>
+  <h1 style="color: {active_color}">{active_name}</h1>
+{tabs_html}
   <p class="count">{total} {word} available</p>
 {latest_html}
 {older_html}
   <div class="footer">
-    <p><strong>Package:</strong> <code>{PACKAGE}</code></p>
     <p>You may need to allow <em>"Install unknown apps"</em> for your browser in Settings.</p>
   </div>
 </body>
@@ -223,8 +283,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def serve_apk(self, path):
-        filename = path.lstrip("/")
-        apk_path = BUILDS_DIR / filename
+        parts = path.lstrip("/").split("/")
+        if len(parts) == 2 and parts[1].endswith(".apk"):
+            project = parts[0]
+            filename = parts[1]
+            apk_path = BUILDS_DIR / project / filename
+        else:
+            filename = path.lstrip("/")
+            apk_path = BUILDS_DIR / filename
+
         if not apk_path.is_file():
             self.not_found()
             return
@@ -245,16 +312,20 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    builds = get_builds()
-    print(f"\n\033[1m{APP_NAME} APK Server\033[0m")
+    all_builds = get_builds()
+    projects = get_projects()
+
+    print(f"\n\033[1mAPK Server\033[0m")
     print(f"  Builds dir: {BUILDS_DIR}")
-    print(f"  Archived:   {len(builds)} build(s)")
-    if builds:
-        latest = builds[0]
-        print(
-            f"  Latest:     #{latest.build_num} {latest.commit_label}"
-            f" ({latest.size_mb:.1f} MB)"
-        )
+    print(f"  Projects:   {', '.join(p[1] for p in projects) if projects else 'none'}")
+    print(f"  Archived:   {len(all_builds)} build(s) total")
+
+    for folder, name, color in projects:
+        pbuilds = get_builds(folder)
+        if pbuilds:
+            latest = pbuilds[0]
+            print(f"    {name}: #{latest.build_num} {latest.commit_label} ({latest.size_mb:.1f} MB)")
+
     print(f"\n\033[1mOpen on your phone:\033[0m")
     for ip in get_local_ips():
         print(f"  \033[36mhttp://{ip}:{PORT}\033[0m")
