@@ -37,7 +37,7 @@ done
 
 # --- Auto-detect project from the app namespace if not specified ---
 if [ -z "$PROJECT" ]; then
-  NAMESPACE=$(grep "^namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+  NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
   case "$NAMESPACE" in
     *growandbuild*) PROJECT="growbuild" ;;
     *robotnerd*)    PROJECT="robotnerd" ;;
