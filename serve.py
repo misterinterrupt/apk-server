@@ -118,16 +118,72 @@ def get_builds(project=None):
     return builds
 
 
+def build_to_dict(b):
+    """Serialize a Build to a JSON-friendly dict for the API."""
+    return {
+        "buildNumber": b.build_num,
+        "commit": b.commit,
+        "dirty": b.dirty,
+        "filename": b.filename,
+        "downloadUrl": f"/{b.project}/{quote(b.filename)}",
+        "sizeBytes": int(b.path.stat().st_size),
+        "sizeMb": round(b.size_mb, 1),
+        "modified": b.modified.isoformat(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Strip query string for routing.
         path_only = unquote(self.path.split("?", 1)[0])
-        if path_only in ("/", "/index.html"):
+        if path_only.startswith("/api/"):
+            self.serve_api(path_only)
+        elif path_only in ("/", "/index.html"):
             self.serve_landing()
         elif path_only.endswith(".apk"):
             self.serve_apk(path_only)
         else:
             self.not_found()
+
+    def serve_api(self, path):
+        """JSON API for programmatic clients (e.g. the apksync library).
+
+        GET /api/projects          → list of project sections
+        GET /api/{project}/builds  → list of builds for a project
+        """
+        parts = [p for p in path.strip("/").split("/") if p]
+        # parts[0] == "api"
+
+        if len(parts) == 2 and parts[1] == "projects":
+            # /api/projects
+            data = [
+                {"id": folder, "name": name, "color": color}
+                for folder, name, color in get_projects()
+            ]
+            self.send_json(data)
+            return
+
+        if len(parts) == 3 and parts[2] == "builds":
+            # /api/{project}/builds
+            project = parts[1]
+            if project not in [p[0] for p in get_projects()]:
+                self.send_json([], status=404)
+                return
+            builds = get_builds(project)
+            data = [build_to_dict(b) for b in builds]
+            self.send_json(data)
+            return
+
+        self.send_json({"error": "Not found"}, status=404)
+
+    def send_json(self, data, status=200):
+        import json as json_mod
+        body = json_mod.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def not_found(self):
         self.send_response(404)
