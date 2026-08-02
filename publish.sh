@@ -2,16 +2,17 @@
 #
 # Build a debug APK and archive it for the APK server.
 #
-# Builds are organized into project subfolders under apk-server/builds/:
+# Builds are organized into project subfolders under builds/:
 #   builds/<slug>/<slug>-{build}-{commit}[-dirty].apk
 #
 # Usage:
-#   ./publish.sh                          # build + archive (robotnerd)
-#   ./publish.sh --project growbuild      # build + archive (growbuild)
-#   ./publish.sh --force                  # rebuild even if already archived
+#   ./publish.sh                                          # auto-detect
+#   ./publish.sh --project growbuild                      # named project
+#   ./publish.sh --project-root /path/to/android-project  # explicit app dir
+#   ./publish.sh --force                                  # rebuild even if archived
 #
-# The script auto-detects the project name from the gradle namespace if
-# --project is not specified.
+# When --project-root is not given, the script assumes it is being run from
+# inside the Android project directory (the old behaviour).
 
 set -euo pipefail
 
@@ -20,20 +21,35 @@ BUILDS_DIR="$SCRIPT_DIR/builds"
 
 # --- Parse args ---
 PROJECT=""
+PROJECT_ROOT=""
 FORCE=false
+shift_next=""
+
 for arg in "$@"; do
   case $arg in
     --force) FORCE=true ;;
-    --project=*) PROJECT="${arg#*=}" ;;
-    --project) shift_next=true ;;
+    --project=*)      PROJECT="${arg#*=}" ;;
+    --project)        shift_next="project" ;;
+    --project-root=*) PROJECT_ROOT="${arg#*=}" ;;
+    --project-root)   shift_next="project-root" ;;
     *)
-      if [ "${shift_next:-}" = "true" ]; then
-        PROJECT="$arg"
-        shift_next=false
+      if [ -n "$shift_next" ]; then
+        case "$shift_next" in
+          project)      PROJECT="$arg" ;;
+          project-root) PROJECT_ROOT="$arg" ;;
+        esac
+        shift_next=""
       fi
       ;;
   esac
 done
+
+# --- Determine the Android project root ---
+# Default to the current working directory if not specified.
+if [ -z "$PROJECT_ROOT" ]; then
+  PROJECT_ROOT="$(pwd)"
+fi
+cd "$PROJECT_ROOT"
 
 # --- Auto-detect project from the app namespace if not specified ---
 if [ -z "$PROJECT" ]; then
@@ -41,16 +57,13 @@ if [ -z "$PROJECT" ]; then
   case "$NAMESPACE" in
     *growandbuild*) PROJECT="growbuild" ;;
     *robotnerd*)    PROJECT="robotnerd" ;;
-    *)              PROJECT="$(basename "$(cd "$SCRIPT_DIR/.." && pwd)")" ;;
+    *usemorewords*) PROJECT="usemorewords" ;;
+    *)              PROJECT="$(basename "$PROJECT_ROOT")" ;;
   esac
 fi
 
 PROJECT_DIR="$BUILDS_DIR/$PROJECT"
 mkdir -p "$PROJECT_DIR"
-
-# We need the git root — could be this dir or a parent.
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
 
 # --- Git metadata ---
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo "0")
@@ -72,12 +85,12 @@ if [ -f "$DEST" ] && [ -z "$SUFFIX" ] && [ "$FORCE" = "false" ]; then
 fi
 
 # --- Build ---
-export ANDROID_HOME="${ANDROID_HOME:-$(pwd)/android-sdk}"
-echo "Building debug APK (project: $PROJECT)..."
-./gradlew :app:assembleDebug
+export ANDROID_HOME="${ANDROID_HOME:-$PROJECT_ROOT/android-sdk}"
+echo "Building debug APK (project: $PROJECT, root: $PROJECT_ROOT)..."
+"$PROJECT_ROOT/gradlew" -p "$PROJECT_ROOT" :app:assembleDebug
 
 # --- Archive ---
-cp app/build/outputs/apk/debug/app-debug.apk "$DEST"
+cp "$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk" "$DEST"
 
 SIZE=$(du -h "$DEST" | cut -f1)
 TOTAL=$(find "$PROJECT_DIR" -name '*.apk' | wc -l)
