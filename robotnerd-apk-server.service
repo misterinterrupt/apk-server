@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/interrupt/Documents/robot_nerd/chatbot-app
-ExecStart=/usr/bin/python3 apk-server/serve.py
+WorkingDirectory=/home/interrupt/Documents/apk-server
+ExecStart=/usr/bin/python3 serve.py
 # `always` (not `on-failure`): a stray SIGTERM/SIGKILL from a tool or
 # manual kill will also trigger a restart, so the server can't be left
 # dead by accident. Explicit `systemctl --user stop` is still respected.
