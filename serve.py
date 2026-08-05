@@ -14,6 +14,7 @@ Usage:
     PORT=9000 ./serve.py      # custom port
 """
 
+import json
 import os
 import re
 import socket
@@ -30,6 +31,7 @@ BUILDS_DIR = HERE / "builds"
 
 # Filename pattern: <anything>-<build>-<commit>[-dirty].apk
 APK_PATTERN = re.compile(r"^(.+)-(\d+)-([0-9a-f]+)(-dirty)?\.apk$")
+AAB_PATTERN = re.compile(r"^(.+)-(\d+)-([0-9a-f]+)(-dirty)?\.aab$")
 
 # Known projects: (folder, display_name, accent_color)
 PROJECTS = [
@@ -40,6 +42,21 @@ PROJECTS = [
 ]
 
 PROJECT_MAP = {folder: (name, color) for folder, name, color in PROJECTS}
+
+# Package names (application IDs) for Play Store publishing.
+# Maps project slug → Android package name.
+PROJECT_PACKAGES = {
+    "robotnerd": "com.ntrpt.robotnerd",
+    "growbuild": "com.ntrpt.growandbuild",
+    "usemorewords": "com.ntrpt.usemorewords",
+    "vkb": "ntrpt.vkb",
+}
+
+# Directory for Play Store secrets and the release keystore.
+PLAY_CONFIG_DIR = Path(os.environ.get(
+    "APK_SERVER_CONFIG_DIR",
+    str(Path.home() / ".config" / "apk-server"),
+))
 
 
 def get_local_ips():
@@ -119,6 +136,53 @@ def get_builds(project=None):
     return builds
 
 
+def get_aab_builds(project):
+    """Return a list of dicts for all archived AABs for a project, newest first."""
+    pdir = BUILDS_DIR / project
+    if not pdir.is_dir():
+        return []
+    aabs = []
+    for f in pdir.glob("*.aab"):
+        stat = f.stat()
+        m = AAB_PATTERN.match(f.name)
+        if m:
+            build_num = int(m.group(2))
+            commit = m.group(3)
+            dirty = bool(m.group(4))
+        else:
+            build_num = 0
+            commit = f.name
+            dirty = False
+        aabs.append({
+            "filename": f.name,
+            "buildNumber": build_num,
+            "commit": commit,
+            "dirty": dirty,
+            "sizeMb": round(stat.st_size / 1024 / 1024, 1),
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        })
+    aabs.sort(key=lambda a: (a["buildNumber"], a["modified"]), reverse=True)
+    return aabs
+
+
+def get_latest_aab(project):
+    """Return the Path to the newest AAB for a project, or None."""
+    pdir = BUILDS_DIR / project
+    if not pdir.is_dir():
+        return None
+    aabs = list(pdir.glob("*.aab"))
+    if not aabs:
+        return None
+
+    def sort_key(path):
+        m = AAB_PATTERN.match(path.name)
+        build_num = int(m.group(2)) if m else 0
+        return (build_num, path.stat().st_mtime)
+
+    aabs.sort(key=sort_key, reverse=True)
+    return aabs[0]
+
+
 def build_to_dict(b):
     """Serialize a Build to a JSON-friendly dict for the API."""
     return {
@@ -134,6 +198,14 @@ def build_to_dict(b):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        """Handle POST requests for Play Store publishing."""
+        path_only = unquote(self.path.split("?", 1)[0])
+        if path_only.startswith("/api/"):
+            self.serve_api_post(path_only)
+        else:
+            self.not_found()
+
     def do_GET(self):
         # Strip query string for routing.
         path_only = unquote(self.path.split("?", 1)[0])
@@ -149,8 +221,10 @@ class Handler(BaseHTTPRequestHandler):
     def serve_api(self, path):
         """JSON API for programmatic clients (e.g. the apksync library).
 
-        GET /api/projects          → list of project sections
-        GET /api/{project}/builds  → list of builds for a project
+        GET /api/projects              → list of project sections
+        GET /api/{project}/builds      → list of builds for a project
+        GET /api/{project}/aab-builds  → list of archived AABs
+        POST /api/{project}/play-publish → publish AAB to Play (TOTP-gated)
         """
         parts = [p for p in path.strip("/").split("/") if p]
         # parts[0] == "api"
@@ -175,11 +249,143 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
+        if len(parts) == 3 and parts[2] == "aab-builds":
+            # /api/{project}/aab-builds
+            project = parts[1]
+            if project not in [p[0] for p in get_projects()]:
+                self.send_json([], status=404)
+                return
+            aabs = get_aab_builds(project)
+            self.send_json(aabs)
+            return
+
         self.send_json({"error": "Not found"}, status=404)
 
+    def serve_api_post(self, path):
+        """Handle POST API requests.
+
+        POST /api/{project}/play-publish
+            Body: {"totp": "123456", "track": "internal", "notes": "..."}
+            Publishes the latest archived AAB to the Play Store.
+            Requires a valid TOTP code (see TOTP_OTP_GATE.md).
+        """
+        parts = [p for p in path.strip("/").split("/") if p]
+
+        if len(parts) == 3 and parts[2] == "play-publish":
+            project = parts[1]
+            self.handle_play_publish(project)
+            return
+
+        self.send_json({"error": "Not found"}, status=404)
+
+    def read_json_body(self):
+        """Read and parse a JSON request body. Returns (data, error)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            return None, "Invalid Content-Length"
+        if length == 0 or length > 65536:
+            return None, "Empty or too-large body"
+        try:
+            raw = self.rfile.read(length)
+            data = json.loads(raw)
+        except (json.JSONDecodeError, OSError) as e:
+            return None, f"Invalid JSON: {e}"
+        if not isinstance(data, dict):
+            return None, "Body must be a JSON object"
+        return data, None
+
+    def handle_play_publish(self, project):
+        """Publish the latest AAB for a project to the Play Store.
+
+        Validates TOTP, then calls playapi to upload + commit.
+        This is the HTTP interface for play-publish.sh.
+        """
+        # Validate project
+        if project not in PROJECT_PACKAGES:
+            self.send_json({"error": f"Unknown project '{project}'"}, status=404)
+            return
+
+        # Parse and validate the request body
+        data, err = self.read_json_body()
+        if err:
+            self.send_json({"error": err}, status=400)
+            return
+
+        totp_code = data.get("totp")
+        if not totp_code:
+            self.send_json({"error": "Missing 'totp' field"}, status=400)
+            return
+
+        track = data.get("track", "internal")
+        if track not in ("internal", "alpha", "beta", "production"):
+            self.send_json(
+                {"error": f"Invalid track '{track}'. Must be: internal, alpha, beta, production"},
+                status=400,
+            )
+            return
+
+        notes = data.get("notes", "")
+
+        # ─── TOTP gate ────────────────────────────────────────────────────
+        # This is the critical security checkpoint. Without a valid, fresh
+        # TOTP code, nothing happens. See TOTP_OTP_GATE.md.
+        try:
+            import totp as totp_mod
+            secret = totp_mod.load_secret()
+        except FileNotFoundError:
+            self.send_json(
+                {"error": "TOTP not enrolled. Run play-enroll.py first."},
+                status=500,
+            )
+            return
+
+        if not totp_mod.check_and_record_replay(secret, totp_code):
+            self.send_json(
+                {"error": "Invalid or expired TOTP code"},
+                status=403,
+            )
+            return
+
+        # ─── Find the AAB to publish ──────────────────────────────────────
+        aab_path = get_latest_aab(project)
+        if not aab_path:
+            self.send_json(
+                {"error": "No AAB found. Build one with play-publish.sh first."},
+                status=404,
+            )
+            return
+
+        # ─── Publish to Play ──────────────────────────────────────────────
+        package = PROJECT_PACKAGES[project]
+        try:
+            import playapi
+            key_file = PLAY_CONFIG_DIR / "play-service-account.json"
+            if not key_file.is_file():
+                self.send_json(
+                    {"error": f"Service account key not found at {key_file}"},
+                    status=500,
+                )
+                return
+
+            client = playapi.Client.from_key_file(str(key_file))
+            result = client.publish(
+                package_name=package,
+                aab_path=str(aab_path),
+                track=track,
+                release_notes=notes,
+            )
+            self.send_json(result, status=200)
+        except playapi.PlayAPIError as e:
+            self.send_json(
+                {"error": str(e), "apiBody": e.body, "statusCode": e.status_code},
+                status=502,
+            )
+        except Exception as e:
+            self.send_json({"error": f"Publish failed: {e}"}, status=500)
+
     def send_json(self, data, status=200):
-        import json as json_mod
-        body = json_mod.dumps(data).encode()
+        body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

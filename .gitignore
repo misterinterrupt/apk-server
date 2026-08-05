@@ -1,2 +1,9 @@
 builds/
 tmp/
+
+# Play Store secrets — never commit these
+**/play-service-account.json
+**/release-keystore.jks
+**/signing.env
+**/totp-secret
+**/totp-replay.json
