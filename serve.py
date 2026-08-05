@@ -312,11 +312,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": err}, status=400)
             return
 
-        totp_code = data.get("totp")
-        if not totp_code:
-            self.send_json({"error": "Missing 'totp' field"}, status=400)
-            return
-
         track = data.get("track", "internal")
         if track not in ("internal", "alpha", "beta", "production"):
             self.send_json(
@@ -326,24 +321,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         notes = data.get("notes", "")
+        totp_code = data.get("totp")
 
         # ─── TOTP gate ────────────────────────────────────────────────────
-        # This is the critical security checkpoint. Without a valid, fresh
-        # TOTP code, nothing happens. See TOTP_OTP_GATE.md.
+        # Controlled by TOTP_ENABLED env var. When off (default), the gate
+        # is skipped for testing. When on, requires a valid code.
+        # See TOTP_OTP_GATE.md.
         try:
             import totp as totp_mod
-            secret = totp_mod.load_secret()
-        except FileNotFoundError:
+            if not totp_mod.gate(user_code=totp_code):
+                self.send_json(
+                    {"error": "Invalid or expired TOTP code (or not enrolled)"},
+                    status=403,
+                )
+                return
+        except FileNotFoundError as e:
             self.send_json(
-                {"error": "TOTP not enrolled. Run play-enroll.py first."},
+                {"error": f"TOTP enrolled but secret missing: {e}"},
                 status=500,
-            )
-            return
-
-        if not totp_mod.check_and_record_replay(secret, totp_code):
-            self.send_json(
-                {"error": "Invalid or expired TOTP code"},
-                status=403,
             )
             return
 

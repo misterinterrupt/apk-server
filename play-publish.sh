@@ -2,12 +2,12 @@
 #
 # play-publish.sh — Build a signed release AAB and publish it to the Play Store.
 #
-# Flow: build AAB → prompt for TOTP → validate TOTP → upload to Play → commit
+# Flow: build AAB → (TOTP if enabled) → upload to Play → commit
 #
 # Requires:
 #   - Service account key at ~/.config/apk-server/play-service-account.json
 #   - Release keystore at ~/.config/apk-server/release-keystore.jks
-#   - TOTP enrollment (run play-enroll.py first)
+#   - TOTP enrollment (run play-enroll.py first) — only if TOTP_ENABLED=1
 #   - The app must already exist in Play Console (first upload is manual —
 #     see PLAY_STORE_SETUP.md Part 4)
 #
@@ -21,12 +21,15 @@
 #                            (default: internal)
 #   --notes <text>           Release notes (default: "Build <version>")
 #   --force                  Rebuild even if AAB already exists
-#   --dry-run                Build and validate TOTP, but don't upload to Play
+#   --dry-run                Build and validate, but don't upload to Play
 #   --help                   Show this help
 #
 # Environment:
 #   APK_SERVER_CONFIG_DIR    Override the secrets directory
 #                            (default: ~/.config/apk-server)
+#   TOTP_ENABLED             Set to 1 to enforce the TOTP gate (default: off)
+#                            When off, publishing proceeds without an
+#                            authenticator code — for testing only.
 
 set -euo pipefail
 
@@ -120,6 +123,22 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   echo ""
 fi
 
+# --- Check TOTP_ENABLED flag ---
+TOTP_IS_ON=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$SCRIPT_DIR')
+import totp
+print('1' if totp.is_enabled() else '0')
+" 2>/dev/null || echo "0")
+
+if [ "$TOTP_IS_ON" = "1" ]; then
+  echo -e "${YELLOW}TOTP gate is ENABLED — authenticator code required.${NC}"
+else
+  echo -e "${YELLOW}TOTP gate is DISABLED — testing mode (no authenticator needed).${NC}"
+  echo -e "${YELLOW}  Set TOTP_ENABLED=1 to enforce the gate.${NC}"
+fi
+echo ""
+
 # --- Check prerequisites ---
 echo -e "${BOLD}Play Store Publish${NC}"
 echo -e "  Project:  $PROJECT"
@@ -141,7 +160,8 @@ if [ ! -f "$SIGNING_ENV" ]; then
   echo -e "${RED}✗ Missing: $SIGNING_ENV${NC} (see PLAY_STORE_SETUP.md)" >&2
   errs=$((errs+1))
 fi
-if [ ! -f "$TOTP_SECRET" ]; then
+# TOTP secret only required when the gate is on
+if [ "$TOTP_IS_ON" = "1" ] && [ ! -f "$TOTP_SECRET" ]; then
   echo -e "${RED}✗ Missing: $TOTP_SECRET${NC} (run play-enroll.py first)" >&2
   errs=$((errs+1))
 fi
@@ -211,29 +231,32 @@ cp "$AAB_PATH" "$AAB_ARCHIVE"
 echo -e "Archived: $AAB_ARCHIVE"
 echo ""
 
-# --- Step 3: TOTP gate ---
-echo -e "${BOLD}Step 2: TOTP verification${NC}"
-echo -e "Open your authenticator app and enter the current 6-digit code."
-echo ""
-
-# Prompt for TOTP code (hidden input for security)
-while true; do
-  read -r -s -p "TOTP code: " TOTP_CODE
+# --- Step 3: TOTP gate (only if enabled) ---
+TOTP_CODE=""
+if [ "$TOTP_IS_ON" = "1" ]; then
+  echo -e "${BOLD}Step 2: TOTP verification${NC}"
+  echo -e "Open your authenticator app and enter the current 6-digit code."
   echo ""
-  if [ -z "$TOTP_CODE" ]; then
-    echo -e "${RED}Error: No code entered. Aborting.${NC}" >&2
-    exit 1
-  fi
 
-  # Verify using the replay-aware check
-  if python3 "$SCRIPT_DIR/totp.py" --verify "$TOTP_CODE" 2>/dev/null; then
-    echo -e "${GREEN}✓ TOTP verified${NC}"
-    break
-  else
-    echo -e "${YELLOW}Invalid code. Try again (or Ctrl+C to abort).${NC}"
-  fi
-done
-echo ""
+  # Prompt for TOTP code (hidden input for security)
+  while true; do
+    read -r -s -p "TOTP code: " TOTP_CODE
+    echo ""
+    if [ -z "$TOTP_CODE" ]; then
+      echo -e "${RED}Error: No code entered. Aborting.${NC}" >&2
+      exit 1
+    fi
+
+    # Verify using the replay-aware check
+    if python3 "$SCRIPT_DIR/totp.py" --verify "$TOTP_CODE" 2>/dev/null; then
+      echo -e "${GREEN}✓ TOTP verified${NC}"
+      break
+    else
+      echo -e "${YELLOW}Invalid code. Try again (or Ctrl+C to abort).${NC}"
+    fi
+  done
+  echo ""
+fi
 
 # --- Step 4: Play API upload ---
 if [ "$DRY_RUN" = "true" ]; then
@@ -253,14 +276,14 @@ if [ -z "$NOTES" ]; then
   NOTES="Build $BUILD_NUM ($COMMIT)"
 fi
 
-# Call the Python publisher
+# Call the Python publisher (pass TOTP code if enabled, empty string if not)
 PUBLISH_OUTPUT=$(python3 "$SCRIPT_DIR/playapi.py" \
   --key-file "$KEY_FILE" \
   --package "$NAMESPACE" \
   --aab "$AAB_PATH" \
   --track "$TRACK" \
   --notes "$NOTES" \
-  --totp-code "$TOTP_CODE" 2>&1) || {
+  ${TOTP_CODE:+--totp-code "$TOTP_CODE"} 2>&1) || {
     echo -e "${RED}Publish failed:${NC}" >&2
     echo "$PUBLISH_OUTPUT" >&2
     # Clean up archived AAB on failure

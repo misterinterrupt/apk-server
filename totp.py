@@ -9,6 +9,11 @@ Authy, Aegis, etc.) uses.
 Can be imported as a module or run directly for quick testing:
     python3 totp.py                  # generate a code from the enrolled secret
     python3 totp.py --verify 123456  # verify a code
+
+Feature flag:
+    Set TOTP_ENABLED=1 to enforce the TOTP gate on publishes.
+    Defaults to off (0) so the publish pipeline can be tested end-to-end
+    without an authenticator. Flip it on once you're ready to go live.
 """
 
 import hmac
@@ -18,6 +23,7 @@ import struct
 import time
 import os
 import json
+import sys
 from pathlib import Path
 
 STEP = 30       # seconds per code
@@ -29,6 +35,40 @@ SECRET_FILE = CONFIG_DIR / "totp-secret"
 REPLAY_FILE = CONFIG_DIR / "totp-replay.json"
 
 REPLAY_TTL = 120  # seconds before a used code is forgotten
+
+
+def is_enabled():
+    """Return True if the TOTP gate is turned on.
+
+    Controlled by the TOTP_ENABLED environment variable:
+      - TOTP_ENABLED=1 or TOTP_ENABLED=true → gate is active
+      - unset, empty, or "0" → gate is skipped (default, for testing)
+    """
+    val = os.environ.get("TOTP_ENABLED", "0").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def gate(secret=None, user_code=None, path=None):
+    """Check the TOTP gate. Returns True if the publish should proceed.
+
+    When TOTP is disabled (is_enabled() is False), always returns True
+    and prints a warning. When enabled, validates the code with replay
+    protection.
+
+    This is the single function all publish paths should call.
+    """
+    if not is_enabled():
+        print("⚠ TOTP gate is DISABLED (TOTP_ENABLED not set). "
+              "Publishing without authenticator check.", file=sys.stderr)
+        return True
+
+    if not user_code:
+        return False
+
+    if secret is None:
+        secret = load_secret()
+
+    return check_and_record_replay(secret, user_code, path)
 
 
 def generate_secret():
@@ -147,8 +187,6 @@ def check_and_record_replay(secret, user_code, path=None):
 # --- CLI for quick testing ---
 
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) > 1 and sys.argv[1] == "--verify":
         if len(sys.argv) < 3:
             print("Usage: totp.py --verify <code>", file=sys.stderr)

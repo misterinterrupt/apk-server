@@ -28,6 +28,10 @@ CLI usage (called by play-publish.sh):
         --aab app-release.aab \\
         --track internal \\
         --totp-code 123456
+
+TOTP gating is controlled by the TOTP_ENABLED environment variable (see
+totp.py). When TOTP_ENABLED=1, --totp-code is required. When unset (default),
+the gate is skipped so the pipeline can be tested end-to-end.
 """
 
 import argparse
@@ -370,30 +374,23 @@ def main():
                         help="Play track: internal, alpha, beta, production")
     parser.add_argument("--notes", default="",
                         help="Release notes text")
-    parser.add_argument("--totp-code", required=True,
-                        help="Current TOTP code from your authenticator app")
+    parser.add_argument("--totp-code", default=None,
+                        help="Current TOTP code from your authenticator app "
+                             "(required when TOTP_ENABLED=1)")
     parser.add_argument("--validate-only", action="store_true",
                         help="Validate credentials and TOTP, but don't upload")
     args = parser.parse_args()
 
     # ─── TOTP gate ────────────────────────────────────────────────────────
-    # The TOTP check with replay protection happens here — the very first
-    # thing we do before touching any Google API.
+    # Controlled by the TOTP_ENABLED env var. When off (default), the gate
+    # is skipped entirely so the publish pipeline can be tested end-to-end.
     import totp
 
-    try:
-        secret = totp.load_secret()
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if not totp.check_and_record_replay(secret, args.totp_code):
-        print("ERROR: Invalid or expired TOTP code.", file=sys.stderr)
+    if not totp.gate(user_code=args.totp_code):
+        print("ERROR: TOTP verification failed.", file=sys.stderr)
         print("       Get a fresh code from your authenticator app and try again.",
               file=sys.stderr)
         sys.exit(403)
-
-    print("✓ TOTP verified")
 
     # ─── Validate the key file ────────────────────────────────────────────
     try:
@@ -429,8 +426,6 @@ def main():
         print(f"\nERROR: {e}", file=sys.stderr)
         if e.body:
             print(f"  API response: {e.body}", file=sys.stderr)
-        if e.status_code:
-            sys.exit(1)
         sys.exit(1)
 
     print()
