@@ -10,10 +10,9 @@ Can be imported as a module or run directly for quick testing:
     python3 totp.py                  # generate a code from the enrolled secret
     python3 totp.py --verify 123456  # verify a code
 
-Feature flag:
-    Set TOTP_ENABLED=1 to enforce the TOTP gate on publishes.
-    Defaults to off (0) so the publish pipeline can be tested end-to-end
-    without an authenticator. Flip it on once you're ready to go live.
+The TOTP gate is currently disabled (TOTP_ENABLED = False below) so the
+publish pipeline can be tested end-to-end without an authenticator. When
+you're ready to go live, set it to True — no other changes needed.
 """
 
 import hmac
@@ -36,29 +35,23 @@ REPLAY_FILE = CONFIG_DIR / "totp-replay.json"
 
 REPLAY_TTL = 120  # seconds before a used code is forgotten
 
-
-def is_enabled():
-    """Return True if the TOTP gate is turned on.
-
-    Controlled by the TOTP_ENABLED environment variable:
-      - TOTP_ENABLED=1 or TOTP_ENABLED=true → gate is active
-      - unset, empty, or "0" → gate is skipped (default, for testing)
-    """
-    val = os.environ.get("TOTP_ENABLED", "0").strip().lower()
-    return val in ("1", "true", "yes", "on")
+# ─── Feature flag ──────────────────────────────────────────────────────────
+# Set to True once TOTP enrollment is done and you want to enforce the
+# authenticator gate on every publish. While False, publishing proceeds
+# without a code (for testing).
+TOTP_ENABLED = False
 
 
 def gate(secret=None, user_code=None, path=None):
     """Check the TOTP gate. Returns True if the publish should proceed.
 
-    When TOTP is disabled (is_enabled() is False), always returns True
-    and prints a warning. When enabled, validates the code with replay
-    protection.
+    When TOTP_ENABLED is False (current), always returns True and prints a
+    warning. When True, validates the code with replay protection.
 
-    This is the single function all publish paths should call.
+    This is the single function all publish paths call.
     """
-    if not is_enabled():
-        print("⚠ TOTP gate is DISABLED (TOTP_ENABLED not set). "
+    if not TOTP_ENABLED:
+        print("⚠ TOTP gate is DISABLED. "
               "Publishing without authenticator check.", file=sys.stderr)
         return True
 

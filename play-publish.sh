@@ -2,12 +2,12 @@
 #
 # play-publish.sh — Build a signed release AAB and publish it to the Play Store.
 #
-# Flow: build AAB → (TOTP if enabled) → upload to Play → commit
+# Flow: build AAB → (TOTP if enabled in totp.py) → upload to Play → commit
 #
 # Requires:
 #   - Service account key at ~/.config/apk-server/play-service-account.json
 #   - Release keystore at ~/.config/apk-server/release-keystore.jks
-#   - TOTP enrollment (run play-enroll.py first) — only if TOTP_ENABLED=1
+#   - TOTP enrollment (run play-enroll.py first) — only if TOTP_ENABLED=True
 #   - The app must already exist in Play Console (first upload is manual —
 #     see PLAY_STORE_SETUP.md Part 4)
 #
@@ -27,9 +27,11 @@
 # Environment:
 #   APK_SERVER_CONFIG_DIR    Override the secrets directory
 #                            (default: ~/.config/apk-server)
-#   TOTP_ENABLED             Set to 1 to enforce the TOTP gate (default: off)
-#                            When off, publishing proceeds without an
-#                            authenticator code — for testing only.
+#
+# TOTP:
+#   The authenticator gate is controlled by TOTP_ENABLED in totp.py.
+#   When False (current), publishing proceeds without a code (testing).
+#   When True, a 6-digit code is required.
 
 set -euo pipefail
 
@@ -62,7 +64,7 @@ while [ $# -gt 0 ]; do
     --force)         FORCE=true; shift ;;
     --dry-run)       DRY_RUN=true; shift ;;
     --help|-h)
-      sed -n '2,/^# Environment:/p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/^# TOTP:/p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -123,19 +125,19 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   echo ""
 fi
 
-# --- Check TOTP_ENABLED flag ---
+# --- Read the TOTP_ENABLED flag from totp.py ---
 TOTP_IS_ON=$(python3 -c "
-import sys, os
+import sys
 sys.path.insert(0, '$SCRIPT_DIR')
 import totp
-print('1' if totp.is_enabled() else '0')
+print('1' if totp.TOTP_ENABLED else '0')
 " 2>/dev/null || echo "0")
 
 if [ "$TOTP_IS_ON" = "1" ]; then
   echo -e "${YELLOW}TOTP gate is ENABLED — authenticator code required.${NC}"
 else
   echo -e "${YELLOW}TOTP gate is DISABLED — testing mode (no authenticator needed).${NC}"
-  echo -e "${YELLOW}  Set TOTP_ENABLED=1 to enforce the gate.${NC}"
+  echo -e "${YELLOW}  Set TOTP_ENABLED = True in totp.py to enforce the gate.${NC}"
 fi
 echo ""
 
@@ -276,7 +278,7 @@ if [ -z "$NOTES" ]; then
   NOTES="Build $BUILD_NUM ($COMMIT)"
 fi
 
-# Call the Python publisher (pass TOTP code if enabled, empty string if not)
+# Call the Python publisher (pass TOTP code if enabled)
 PUBLISH_OUTPUT=$(python3 "$SCRIPT_DIR/playapi.py" \
   --key-file "$KEY_FILE" \
   --package "$NAMESPACE" \
