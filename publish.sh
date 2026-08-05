@@ -53,11 +53,16 @@ cd "$PROJECT_ROOT"
 
 # --- Auto-detect project from the app namespace if not specified ---
 if [ -z "$PROJECT" ]; then
-  NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+  # Check Kotlin DSL (.kts) first, then fall back to Groovy (.gradle).
+  NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*["'\'']\(.*\)["'\''].*/\1/' || true)
+  if [ -z "$NAMESPACE" ]; then
+    NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle 2>/dev/null | head -1 | sed 's/.*["'\'']\(.*\)["'\''].*/\1/' || true)
+  fi
   case "$NAMESPACE" in
     *growandbuild*) PROJECT="growbuild" ;;
     *robotnerd*)    PROJECT="robotnerd" ;;
     *usemorewords*) PROJECT="usemorewords" ;;
+    *vkb*)          PROJECT="vkb" ;;
     *)              PROJECT="$(basename "$PROJECT_ROOT")" ;;
   esac
 fi

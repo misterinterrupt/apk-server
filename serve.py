@@ -36,6 +36,7 @@ PROJECTS = [
     ("robotnerd", "RobotNerd", "#7c4dff"),
     ("growbuild", "Grow & Build", "#4caf50"),
     ("usemorewords", "Use More Words", "#2C5F5D"),
+    ("vkb", "VKB", "#FF6B35"),
 ]
 
 PROJECT_MAP = {folder: (name, color) for folder, name, color in PROJECTS}
