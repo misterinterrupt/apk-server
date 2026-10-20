@@ -7,17 +7,18 @@
 #
 # Usage:
 #   ./publish.sh                                          # auto-detect
-#   ./publish.sh --project growbuild                      # named project
+#   ./publish.sh --project <slug>                         # named project
 #   ./publish.sh --project-root /path/to/android-project  # explicit app dir
 #   ./publish.sh --force                                  # rebuild even if archived
 #
 # When --project-root is not given, the script assumes it is being run from
-# inside the Android project directory (the old behaviour).
+# inside the Android project directory.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILDS_DIR="$SCRIPT_DIR/builds"
+CONFIG_FILE="$SCRIPT_DIR/projects.json"
 
 # --- Parse args ---
 PROJECT=""
@@ -45,7 +46,6 @@ for arg in "$@"; do
 done
 
 # --- Determine the Android project root ---
-# Default to the current working directory if not specified.
 if [ -z "$PROJECT_ROOT" ]; then
   PROJECT_ROOT="$(pwd)"
 fi
@@ -53,18 +53,29 @@ cd "$PROJECT_ROOT"
 
 # --- Auto-detect project from the app namespace if not specified ---
 if [ -z "$PROJECT" ]; then
-  # Check Kotlin DSL (.kts) first, then fall back to Groovy (.gradle).
-  NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*["'\'']\(.*\)["'\''].*/\1/' || true)
+  NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle.kts 2>/dev/null | head -1 | sed 's/.*["'"'"']\(.*\)["'"'"'].*/\1/' || true)
   if [ -z "$NAMESPACE" ]; then
-    NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle 2>/dev/null | head -1 | sed 's/.*["'\'']\(.*\)["'\''].*/\1/' || true)
+    NAMESPACE=$(grep -E "^[[:space:]]*namespace" app/build.gradle 2>/dev/null | head -1 | sed 's/.*["'"'"']\(.*\)["'"'"'].*/\1/' || true)
   fi
-  case "$NAMESPACE" in
-    *growandbuild*) PROJECT="growbuild" ;;
-    *robotnerd*)    PROJECT="robotnerd" ;;
-    *usemorewords*) PROJECT="usemorewords" ;;
-    *vkb*)          PROJECT="vkb" ;;
-    *)              PROJECT="$(basename "$PROJECT_ROOT")" ;;
-  esac
+
+  # Look up namespace in projects.json
+  if [ -n "$NAMESPACE" ] && [ -f "$CONFIG_FILE" ]; then
+    PROJECT=$(python3 -c "
+import json, sys
+with open('$CONFIG_FILE') as f:
+    cfg = json.load(f)
+for p in cfg.get('projects', []):
+    if p.get('namespace') == '$NAMESPACE':
+        print(p['slug'])
+        sys.exit(0)
+print('')
+" 2>/dev/null || true)
+  fi
+
+  # Fallback: use directory basename
+  if [ -z "$PROJECT" ]; then
+    PROJECT="$(basename "$PROJECT_ROOT")"
+  fi
 fi
 
 PROJECT_DIR="$BUILDS_DIR/$PROJECT"

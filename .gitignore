@@ -7,3 +7,8 @@ tmp/
 **/signing.env
 **/totp-secret
 **/totp-replay.json
+
+# Runtime artifacts
+.robotnerd/
+__pycache__/
+*.pyc

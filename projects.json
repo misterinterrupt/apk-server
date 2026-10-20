@@ -1,0 +1,10 @@
+{
+  "projects": [
+    {
+      "slug": "robotnerd",
+      "name": "RobotNerd",
+      "color": "#7c4dff",
+      "namespace": "com.ntrpt.robotnerd"
+    }
+  ]
+}

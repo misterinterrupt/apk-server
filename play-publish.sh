@@ -15,7 +15,7 @@
 #   ./play-publish.sh [options]
 #
 # Options:
-#   --project <slug>         Project slug (robotnerd, growbuild, vkb, ...)
+#   --project <slug>         Project slug (from projects.json)
 #   --project-root <path>    Path to the Android project root (default: cwd)
 #   --track <track>          Play track: internal, alpha, beta, production
 #                            (default: internal)
@@ -37,6 +37,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILDS_DIR="$SCRIPT_DIR/builds"
+CONFIG_FILE="$SCRIPT_DIR/projects.json"
 CONFIG_DIR="${APK_SERVER_CONFIG_DIR:-$HOME/.config/apk-server}"
 
 # Colors
@@ -101,17 +102,25 @@ if [ -z "$PROJECT" ]; then
     NAMESPACE=$(grep -E "^[[:space:]]*namespace" "$PROJECT_ROOT/app/build.gradle" 2>/dev/null \
       | head -1 | sed 's/.*["'"'"']\(.*\)["'"'"'].*/\1/' || true)
   fi
-  case "$NAMESPACE" in
-    *growandbuild*) PROJECT="growbuild" ;;
-    *robotnerd*)    PROJECT="robotnerd" ;;
-    *usemorewords*) PROJECT="usemorewords" ;;
-    *vkb*)          PROJECT="vkb" ;;
-    *)
-      echo -e "${RED}Error: Could not auto-detect project from namespace '$NAMESPACE'${NC}" >&2
-      echo -e "  Specify with --project <slug>" >&2
-      exit 1
-      ;;
-  esac
+
+  if [ -n "$NAMESPACE" ] && [ -f "$CONFIG_FILE" ]; then
+    PROJECT=$(python3 -c "
+import json, sys
+with open('$CONFIG_FILE') as f:
+    cfg = json.load(f)
+for p in cfg.get('projects', []):
+    if p.get('namespace') == '$NAMESPACE':
+        print(p['slug'])
+        sys.exit(0)
+print('')
+" 2>/dev/null || true)
+  fi
+
+  if [ -z "$PROJECT" ]; then
+    echo -e "${RED}Error: Could not auto-detect project from namespace '$NAMESPACE'${NC}" >&2
+    echo -e "  Specify with --project <slug> or add the namespace to projects.json" >&2
+    exit 1
+  fi
 fi
 
 # --- Git metadata ---
@@ -162,7 +171,6 @@ if [ ! -f "$SIGNING_ENV" ]; then
   echo -e "${RED}✗ Missing: $SIGNING_ENV${NC} (see PLAY_STORE_SETUP.md)" >&2
   errs=$((errs+1))
 fi
-# TOTP secret only required when the gate is on
 if [ "$TOTP_IS_ON" = "1" ] && [ ! -f "$TOTP_SECRET" ]; then
   echo -e "${RED}✗ Missing: $TOTP_SECRET${NC} (run play-enroll.py first)" >&2
   errs=$((errs+1))
@@ -193,13 +201,11 @@ if [ "$NEEDS_BUILD" = "true" ]; then
   echo ""
   echo -e "${BOLD}Step 1: Building signed release AAB...${NC}"
 
-  # Source signing credentials
   set -a
   # shellcheck disable=SC1090
   source "$SIGNING_ENV"
   set +a
 
-  # Check that Gradle can find the keystore
   if [ -z "${KEYSTORE_PATH:-}" ] || [ -z "${KEYSTORE_PASSWORD:-}" ] || \
      [ -z "${KEY_ALIAS:-}" ] || [ -z "${KEY_PASSWORD:-}" ]; then
     echo -e "${RED}Error: signing.env must define KEYSTORE_PATH, KEYSTORE_PASSWORD,${NC}" >&2
@@ -207,7 +213,6 @@ if [ "$NEEDS_BUILD" = "true" ]; then
     exit 1
   fi
 
-  # Pass signing config to Gradle via properties
   export ANDROID_HOME="${ANDROID_HOME:-$PROJECT_ROOT/android-sdk}"
 
   "$PROJECT_ROOT/gradlew" -p "$PROJECT_ROOT" :app:bundleRelease \
@@ -240,7 +245,6 @@ if [ "$TOTP_IS_ON" = "1" ]; then
   echo -e "Open your authenticator app and enter the current 6-digit code."
   echo ""
 
-  # Prompt for TOTP code (hidden input for security)
   while true; do
     read -r -s -p "TOTP code: " TOTP_CODE
     echo ""
@@ -249,7 +253,6 @@ if [ "$TOTP_IS_ON" = "1" ]; then
       exit 1
     fi
 
-    # Verify using the replay-aware check
     if python3 "$SCRIPT_DIR/totp.py" --verify "$TOTP_CODE" 2>/dev/null; then
       echo -e "${GREEN}✓ TOTP verified${NC}"
       break
@@ -273,12 +276,10 @@ fi
 
 echo -e "${BOLD}Step 3: Publishing to Play Store...${NC}"
 
-# Determine the release notes
 if [ -z "$NOTES" ]; then
   NOTES="Build $BUILD_NUM ($COMMIT)"
 fi
 
-# Call the Python publisher (pass TOTP code if enabled)
 PUBLISH_OUTPUT=$(python3 "$SCRIPT_DIR/playapi.py" \
   --key-file "$KEY_FILE" \
   --package "$NAMESPACE" \
@@ -288,7 +289,6 @@ PUBLISH_OUTPUT=$(python3 "$SCRIPT_DIR/playapi.py" \
   ${TOTP_CODE:+--totp-code "$TOTP_CODE"} 2>&1) || {
     echo -e "${RED}Publish failed:${NC}" >&2
     echo "$PUBLISH_OUTPUT" >&2
-    # Clean up archived AAB on failure
     rm -f "$AAB_ARCHIVE"
     exit 1
   }

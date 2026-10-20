@@ -3,11 +3,11 @@
 APK Server — serves archived debug APKs over HTTP, with project tabs.
 
 Builds are organized into project subfolders under builds/:
-  builds/robotnerd/robotnerd-{build}-{commit}[-dirty].apk
-  builds/growbuild/growbuild-{build}-{commit}[-dirty].apk
+  builds/<slug>/<slug>-{build}-{commit}[-dirty].apk
 
-The landing page shows a tab for each project. The server re-scans on every
-request, so newly published builds appear instantly without a restart.
+Projects are configured in projects.json. The landing page shows a tab for
+each project. The server re-scans on every request, so newly published builds
+appear instantly without a restart.
 
 Usage:
     ./serve.py                # port 8080
@@ -28,35 +28,46 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 HERE = Path(__file__).resolve().parent
 BUILDS_DIR = HERE / "builds"
+CONFIG_FILE = HERE / "projects.json"
 
 # Filename pattern: <anything>-<build>-<commit>[-dirty].apk
 APK_PATTERN = re.compile(r"^(.+)-(\d+)-([0-9a-f]+)(-dirty)?\.apk$")
 AAB_PATTERN = re.compile(r"^(.+)-(\d+)-([0-9a-f]+)(-dirty)?\.aab$")
 
-# Known projects: (folder, display_name, accent_color)
-PROJECTS = [
-    ("robotnerd", "RobotNerd", "#7c4dff"),
-    ("growbuild", "Grow & Build", "#4caf50"),
-    ("usemorewords", "Use More Words", "#2C5F5D"),
-    ("vkb", "VKB", "#FF6B35"),
-]
 
-PROJECT_MAP = {folder: (name, color) for folder, name, color in PROJECTS}
+def load_config():
+    """Load project configuration from projects.json."""
+    if CONFIG_FILE.is_file():
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            return cfg.get("projects", [])
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Fallback: auto-discover from builds/ directory
+    projects = []
+    if BUILDS_DIR.is_dir():
+        for folder in sorted(BUILDS_DIR.iterdir()):
+            if folder.is_dir():
+                projects.append({
+                    "slug": folder.name,
+                    "name": folder.name.replace("-", " ").title(),
+                    "color": "#7c4dff",
+                    "namespace": "",
+                })
+    return projects
 
-# Package names (application IDs) for Play Store publishing.
-# Maps project slug → Android package name.
-PROJECT_PACKAGES = {
-    "robotnerd": "com.ntrpt.robotnerd",
-    "growbuild": "com.ntrpt.growandbuild",
-    "usemorewords": "com.ntrpt.usemorewords",
-    "vkb": "ntrpt.vkb",
-}
 
-# Directory for Play Store secrets and the release keystore.
-PLAY_CONFIG_DIR = Path(os.environ.get(
-    "APK_SERVER_CONFIG_DIR",
-    str(Path.home() / ".config" / "apk-server"),
-))
+def build_project_map():
+    """Build (slug -> (name, color)) map from config."""
+    projects = load_config()
+    return {p["slug"]: (p["name"], p["color"]) for p in projects}
+
+
+def build_package_map():
+    """Build (slug -> namespace) map from config."""
+    projects = load_config()
+    return {p["slug"]: p.get("namespace", "") for p in projects if p.get("namespace")}
 
 
 def get_local_ips():
@@ -112,10 +123,11 @@ class Build:
 
 
 def get_projects():
+    project_map = build_project_map()
     result = []
-    for folder, name, color in PROJECTS:
-        if (BUILDS_DIR / folder).is_dir():
-            result.append((folder, name, color))
+    for slug, (name, color) in project_map.items():
+        if (BUILDS_DIR / slug).is_dir():
+            result.append((slug, name, color))
     return result
 
 
@@ -197,6 +209,30 @@ def build_to_dict(b):
     }
 
 
+def get_namespace_map():
+    """Build a mapping from namespace substrings to project slugs, for
+    auto-detection in publish.sh.  Loaded from projects.json."""
+    projects = load_config()
+    mapping = {}
+    for p in projects:
+        ns = p.get("namespace", "")
+        if ns:
+            mapping[ns] = p["slug"]
+    return mapping
+
+
+# Directory for Play Store secrets and the release keystore.
+PLAY_CONFIG_DIR = Path(os.environ.get(
+    "APK_SERVER_CONFIG_DIR",
+    str(Path.home() / ".config" / "apk-server"),
+))
+
+# Expose the project config for shell scripts.
+PROJECTS = load_config()
+PROJECT_MAP = build_project_map()
+PROJECT_PACKAGES = build_package_map()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle POST requests for Play Store publishing."""
@@ -252,7 +288,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[2] == "aab-builds":
             # /api/{project}/aab-builds
             project = parts[1]
-            if project not in [p[0] for p in get_projects()]:
+            project_map = build_project_map()
+            if project not in project_map:
                 self.send_json([], status=404)
                 return
             aabs = get_aab_builds(project)
@@ -301,8 +338,9 @@ class Handler(BaseHTTPRequestHandler):
         Validates TOTP, then calls playapi to upload + commit.
         This is the HTTP interface for play-publish.sh.
         """
+        packages = build_package_map()
         # Validate project
-        if project not in PROJECT_PACKAGES:
+        if project not in packages:
             self.send_json({"error": f"Unknown project '{project}'"}, status=404)
             return
 
@@ -313,46 +351,40 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         track = data.get("track", "internal")
+        notes = data.get("notes", "")
+        totp_code = data.get("totp", "")
+
         if track not in ("internal", "alpha", "beta", "production"):
             self.send_json(
-                {"error": f"Invalid track '{track}'. Must be: internal, alpha, beta, production"},
+                {"error": f"Invalid track: {track}. Must be one of: internal, alpha, beta, production"},
                 status=400,
             )
             return
 
-        notes = data.get("notes", "")
-        totp_code = data.get("totp")
-
-        # ─── TOTP gate ────────────────────────────────────────────────────
-        # Controlled by TOTP_ENABLED env var. When off (default), the gate
-        # is skipped for testing. When on, requires a valid code.
-        # See TOTP_OTP_GATE.md.
-        try:
-            import totp as totp_mod
-            if not totp_mod.gate(user_code=totp_code):
+        # TOTP verification
+        import totp
+        if totp.TOTP_ENABLED:
+            if not totp_code:
                 self.send_json(
-                    {"error": "Invalid or expired TOTP code (or not enrolled)"},
-                    status=403,
+                    {"error": "TOTP code required (TOTP_ENABLED=True)"},
+                    status=401,
                 )
                 return
-        except FileNotFoundError as e:
-            self.send_json(
-                {"error": f"TOTP enrolled but secret missing: {e}"},
-                status=500,
-            )
-            return
+            if not totp.verify(totp_code):
+                self.send_json({"error": "Invalid TOTP code"}, status=403)
+                return
 
-        # ─── Find the AAB to publish ──────────────────────────────────────
+        # Find latest AAB
         aab_path = get_latest_aab(project)
         if not aab_path:
             self.send_json(
-                {"error": "No AAB found. Build one with play-publish.sh first."},
+                {"error": f"No AAB builds found for project '{project}'. Build one with play-publish.sh first."},
                 status=404,
             )
             return
 
-        # ─── Publish to Play ──────────────────────────────────────────────
-        package = PROJECT_PACKAGES[project]
+        # Publish to Play
+        package = packages[project]
         try:
             import playapi
             key_file = PLAY_CONFIG_DIR / "play-service-account.json"
@@ -432,6 +464,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             tabs_html = f'<div class="tabs">{"".join(tab_items)}</div>'
 
+        project_map = build_project_map()
+        active_color = project_map.get(active_project, ("App", "#7c4dff"))[1] if active_project else "#7c4dff"
+        active_name = project_map.get(active_project, ("App", "#7c4dff"))[0] if active_project else "App"
+
         if latest:
             latest_html = (
                 f'  <a class="latest" href="{latest.url}">\n'
@@ -473,9 +509,6 @@ class Handler(BaseHTTPRequestHandler):
 
         total = len(builds)
         word = "build" if total == 1 else "builds"
-        proj_info = PROJECT_MAP.get(active_project, ("App", "#7c4dff"))
-        active_name = proj_info[0]
-        active_color = proj_info[1]
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -576,6 +609,7 @@ if __name__ == "__main__":
 
     print(f"\n\033[1mAPK Server\033[0m")
     print(f"  Builds dir: {BUILDS_DIR}")
+    print(f"  Config:     {CONFIG_FILE}")
     print(f"  Projects:   {', '.join(p[1] for p in projects) if projects else 'none'}")
     print(f"  Archived:   {len(all_builds)} build(s) total")
 
