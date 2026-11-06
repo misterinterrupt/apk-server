@@ -19,8 +19,9 @@ import os
 import re
 import socket
 import subprocess
+import sys
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote, quote
 
@@ -234,8 +235,18 @@ PROJECT_PACKAGES = build_package_map()
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keep-alive — every response path sends Content-Length, so
+    # persistent connections are safe. `timeout` reaps idle keep-alive
+    # connections so threads don't pile up.
+    protocol_version = "HTTP/1.1"
+    timeout = 60
+
     def do_POST(self):
         """Handle POST requests for Play Store publishing."""
+        # POSTs (Play publishing) are rare — close the connection after
+        # each one so an unread request body can't desync a reused
+        # keep-alive connection.
+        self.close_connection = True
         path_only = unquote(self.path.split("?", 1)[0])
         if path_only.startswith("/api/"):
             self.serve_api_post(path_only)
@@ -420,10 +431,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def not_found(self):
+        body = b"Not found"
         self.send_response(404)
         self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"Not found")
+        self.wfile.write(body)
 
     def serve_landing(self):
         projects = get_projects()
@@ -589,21 +602,81 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         size = apk_path.stat().st_size
-        self.send_response(200)
+
+        # Range support (bytes=N-, bytes=N-M, bytes=-N) so an interrupted
+        # download can resume instead of restarting 20MB from byte zero.
+        start, end = 0, size - 1
+        status = 200
+        range_header = self.headers.get("Range")
+        if range_header:
+            m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                else:  # suffix form: bytes=-N → the last N bytes
+                    start = max(0, size - int(m.group(2)))
+                if start >= size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status = 206
+
+        remaining = end - start + 1
+        self.send_response(status)
         self.send_header("Content-Type", "application/vnd.android.package-archive")
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", str(remaining))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
-        with open(apk_path, "rb") as f:
-            while chunk := f.read(65536):
-                self.wfile.write(chunk)
+        try:
+            with open(apk_path, "rb") as f:
+                f.seek(start)
+                sent = 0
+                while chunk := f.read(65536):
+                    if sent + len(chunk) > remaining:
+                        chunk = chunk[: remaining - sent]
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    if sent >= remaining:
+                        break
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            # Client hung up mid-transfer (flaky mobile/Tailscale link) —
+            # not a server error. Log quietly and drop the connection.
+            print(f"  {self.address_string()} - download aborted: {filename}")
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         print(f"  {self.address_string()} - {fmt % args}")
 
 
+class ApkServer(ThreadingHTTPServer):
+    """Threaded server: a slow APK download must not block API polls.
+
+    The single-threaded HTTPServer head-of-line-blocked every request
+    behind an in-flight download, and its listen backlog of 5 made the
+    kernel RST excess connections — surfacing on Android as
+    "SocketException: Software caused connection abort".
+    """
+
+    daemon_threads = True
+    request_queue_size = 64
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            print(f"  {client_address[0]} - client disconnected: {type(exc).__name__}")
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ApkServer(("0.0.0.0", PORT), Handler)
     all_builds = get_builds()
     projects = get_projects()
 
