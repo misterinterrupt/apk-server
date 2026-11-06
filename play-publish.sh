@@ -125,7 +125,10 @@ fi
 
 # --- Git metadata ---
 cd "$PROJECT_ROOT"
-BUILD_NUM=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+# Same scheme as publish.sh and as gradle's versionCode: the Unix timestamp
+# of HEAD. A per-branch commit count names the same commit differently on
+# different branches and can collide with another build's number.
+BUILD_NUM=$(git log -1 --format=%ct 2>/dev/null || echo "0")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "nogit")
 
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
